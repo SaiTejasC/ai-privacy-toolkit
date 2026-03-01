@@ -1,7 +1,7 @@
 # Minimization expansion
 This addition to the AI Privacy Toolkit was done as a part of the Data Protection Technologies course at UvA and extends the minimization module. This expansion aims to implement k-anonymity in data minimization. If a dataset has k-anonymity, it means that each subject is indistinguishable from at least k-1 other subjects with respect to quasi-identifiers. This makes it harder to connect specific individuals to their sensitive information. The reason for this implementation is that the current minimization is done with respect to the model accuracy. Generalisations are made to increase data privacy; thus, there should be an option to make generalisations to achieve a target level of data privacy. For this expansion, k-anonymity was chosen because it is a simple way to measure data privacy. However, k-anonymity remains vulnerable to homogeneity attacks, but this expansion can serve as a proof of concept, and additional data privacy measurements can be added in future work.
 
-apt/minimization/minimiser_expansion
+## apt/minimization/minimiser_expansion
 This new file contains functions to calculate k-anonymity
 
 - k_anonymity(data):
