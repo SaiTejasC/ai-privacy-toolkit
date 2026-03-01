@@ -5,6 +5,7 @@ from typing import Union, Optional
 from dataclasses import dataclass
 from collections import Counter
 import pandas as pd
+from apt.minimization import minimiser_expansion
 import numpy as np
 import copy
 import sys
@@ -19,6 +20,8 @@ from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
 
+ACCURACY_MODE = 0
+K_ANONYMITY_MODE = 1
 
 @dataclass
 class NCPScores:
@@ -79,7 +82,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
+                 mode: Optional[int]  = ACCURACY_MODE,
                  target_accuracy: Optional[float] = 0.998,
+                 target_k: Optional[int] = 2,
                  cells: Optional[list] = None,
                  categorical_features: Optional[Union[np.ndarray, list]] = None,
                  encoder: Optional[Union[OrdinalEncoder, OneHotEncoder]] = None,
@@ -98,7 +103,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 # the same currently for single and multi output probabilities.
                 self.estimator = SklearnClassifier(estimator,
                                                    CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES)
+        self.mode = mode
         self.target_accuracy = target_accuracy
+        self.target_k = target_k
         self.cells = cells
         self.categorical_features = []
         if categorical_features:
@@ -132,7 +139,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         :return: Parameter names mapped to their values
         """
         ret = {}
+        ret['mode'] = self.mode
         ret['target_accuracy'] = self.target_accuracy
+        ret['target_k'] = self.target_k
         ret['categorical_features'] = self.categorical_features
         ret['features_to_minimize'] = self.features_to_minimize
         ret['feature_slices'] = self.feature_slices
@@ -160,8 +169,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         :type cells: list of objects, optional
         :return: self
         """
+        if 'mode' in params:
+            self.mode = params['mode']
         if 'target_accuracy' in params:
             self.target_accuracy = params['target_accuracy']
+        if 'target_k' in params:
+            self.target_k = params['target_k']
         if 'categorical_features' in params:
             self.categorical_features = params['categorical_features']
         if 'features_to_minimize' in params:
@@ -270,136 +283,275 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         # Going to fit
         # (currently not dealing with option to fit with only X and y and no estimator)
         if self.estimator and dataset and dataset.get_samples() is not None and dataset.get_labels() is not None:
-            x = pd.DataFrame(dataset.get_samples(), columns=self._features)
-            if not self.features_to_minimize:
-                self.features_to_minimize = self._features
-            self.features_to_minimize = [str(i) for i in self.features_to_minimize]
-            if not all(elem in self._features for elem in self.features_to_minimize):
-                raise ValueError('features to minimize should be a subset of features names')
-            if self.feature_slices:
-                temp_list = []
-                for slice in self.feature_slices:
-                    new_slice = [str(i) for i in slice]
-                    if not all(elem in self._features for elem in new_slice):
-                        raise ValueError('features in slices should be a subset of features names')
-                    temp_list.append(new_slice)
-                self.feature_slices = temp_list
-            x_qi = x.loc[:, self.features_to_minimize]
 
-            # divide dataset into train and test
-            used_data = x
-            if self.train_only_features_to_minimize:
-                used_data = x_qi
-            if self.is_regression:
-                x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(), test_size=0.4,
-                                                                    random_state=14)
-            else:
-                try:
-                    x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(),
-                                                                        stratify=dataset.get_labels(), test_size=0.4,
-                                                                        random_state=18)
-                except ValueError:
-                    print('Could not stratify split due to uncommon class value, doing unstratified split instead')
+            #the standard mode for minimisations. does as muchgeneralization as possible while keeping accuracy above target accuracy.
+            if self.mode == ACCURACY_MODE:
+                x = pd.DataFrame(dataset.get_samples(), columns=self._features)
+                if not self.features_to_minimize:
+                    self.features_to_minimize = self._features
+                self.features_to_minimize = [str(i) for i in self.features_to_minimize]
+                if not all(elem in self._features for elem in self.features_to_minimize):
+                    raise ValueError('features to minimize should be a subset of features names')
+                if self.feature_slices:
+                    temp_list = []
+                    for slice in self.feature_slices:
+                        new_slice = [str(i) for i in slice]
+                        if not all(elem in self._features for elem in new_slice):
+                            raise ValueError('features in slices should be a subset of features names')
+                        temp_list.append(new_slice)
+                    self.feature_slices = temp_list
+                x_qi = x.loc[:, self.features_to_minimize]
+
+                # divide dataset into train and test
+                used_data = x
+                if self.train_only_features_to_minimize:
+                    used_data = x_qi
+                if self.is_regression:
                     x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(), test_size=0.4,
-                                                                        random_state=18)
-
-            x_train_qi = x_train.loc[:, self.features_to_minimize]
-            x_test_qi = x_test.loc[:, self.features_to_minimize]
-            used_x_train = x_train
-            used_x_test = x_test
-            if self.train_only_features_to_minimize:
-                used_x_train = x_train_qi
-                used_x_test = x_test_qi
-
-            # collect feature data (such as min, max)
-            self._feature_data = self._get_feature_data(x)
-
-            self.cells = []
-            self._categorical_values = {}
-
-            if self.is_regression:
-                self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
-            else:
-                self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2,
-                                                  min_samples_leaf=1)
-
-            # prepare data for DT
-            self._encode_categorical_features(used_data, save_mapping=True)
-            x_prepared = self._encode_categorical_features(used_x_train)
-            self._dt.fit(x_prepared, y_train)
-            x_prepared_test = self._encode_categorical_features(used_x_test)
-
-            self._calculate_cells()
-            self._modify_cells()
-            # features that are not from QI should not be part of generalizations
-            for feature in self._features:
-                if feature not in self.features_to_minimize:
-                    self._remove_feature_from_cells(self.cells, self._cells_by_id, feature)
-
-            nodes = self._get_nodes_level(0)
-            self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
-
-            # self._cells currently holds the generalization created from the tree leaves
-            generalized = self._generalize(x_test, x_prepared_test, nodes)
-
-            # check accuracy
-            accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-            print('Initial accuracy of model on generalized data, relative to original model predictions '
-                  '(base generalization derived from tree, before improvements): %f' % accuracy)
-
-            # if accuracy above threshold, improve generalization
-            if accuracy > self.target_accuracy:
-                print('Improving generalizations')
-                self._level = 0
-                while accuracy > self.target_accuracy:
-                    self._level += 1
-                    cells_previous_iter = self.cells
-                    generalization_prev_iter = self._generalizations
-                    cells_by_id_prev = self._cells_by_id
-                    nodes = self._get_nodes_level(self._level)
-
+                                                                        random_state=14)
+                else:
                     try:
-                        self._calculate_level_cells(self._level)
-                    except TypeError as e:
-                        print(e)
-                        self._level -= 1
-                        break
+                        x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(),
+                                                                            stratify=dataset.get_labels(), test_size=0.4,
+                                                                            random_state=18)
+                    except ValueError:
+                        print('Could not stratify split due to uncommon class value, doing unstratified split instead')
+                        x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(), test_size=0.4,
+                                                                            random_state=18)
 
-                    self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+                x_train_qi = x_train.loc[:, self.features_to_minimize]
+                x_test_qi = x_test.loc[:, self.features_to_minimize]
+                used_x_train = x_train
+                used_x_test = x_test
+                if self.train_only_features_to_minimize:
+                    used_x_train = x_train_qi
+                    used_x_test = x_test_qi
 
-                    generalized = self._generalize(x_test, x_prepared_test, nodes)
-                    accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-                    # if accuracy passed threshold roll back to previous iteration generalizations
-                    if accuracy < self.target_accuracy:
-                        self.cells = cells_previous_iter
-                        self._generalizations = generalization_prev_iter
-                        self._cells_by_id = cells_by_id_prev
-                        self._level -= 1
-                        break
-                    else:
-                        print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
+                # collect feature data (such as min, max)
+                self._feature_data = self._get_feature_data(x)
 
-            # if accuracy below threshold, improve accuracy by removing features from generalization
-            elif accuracy < self.target_accuracy:
-                print('Improving accuracy')
-                while accuracy < self.target_accuracy:
-                    removed_feature = self._remove_feature_from_generalization(x_test, x_prepared_test,
-                                                                               nodes, y_test,
-                                                                               self._feature_data, accuracy,
-                                                                               self.generalize_using_transform)
-                    if removed_feature is None:
-                        break
+                self.cells = []
+                self._categorical_values = {}
 
-                    generalized = self._generalize(x_test, x_prepared_test, nodes)
-                    accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-                    print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
+                if self.is_regression:
+                    self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
+                else:
+                    self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2,
+                                                    min_samples_leaf=1)
 
-            # self._cells currently holds the chosen generalization based on target accuracy
+                # prepare data for DT
+                self._encode_categorical_features(used_data, save_mapping=True)
+                x_prepared = self._encode_categorical_features(used_x_train)
+                self._dt.fit(x_prepared, y_train)
+                x_prepared_test = self._encode_categorical_features(used_x_test)
 
-            # calculate iLoss
-            x_test_dataset = ArrayDataset(x_test, features_names=self._features)
-            self._ncp_scores.fit_score = self.calculate_ncp(x_test_dataset)
-            self._ncp_scores.generalizations_score = self.calculate_ncp(x_test_dataset)
+                self._calculate_cells()
+                self._modify_cells()
+                # features that are not from QI should not be part of generalizations
+                for feature in self._features:
+                    if feature not in self.features_to_minimize:
+                        self._remove_feature_from_cells(self.cells, self._cells_by_id, feature)
+
+                nodes = self._get_nodes_level(0)
+                self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+
+                # self._cells currently holds the generalization created from the tree leaves
+                generalized = self._generalize(x_test, x_prepared_test, nodes)
+
+                # check accuracy
+                accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                print('Initial accuracy of model on generalized data, relative to original model predictions '
+                    '(base generalization derived from tree, before improvements): %f' % accuracy)
+
+                # if accuracy above threshold, improve generalization
+                if accuracy > self.target_accuracy:
+                    print('Improving generalizations')
+                    self._level = 0
+                    while accuracy > self.target_accuracy:
+                        self._level += 1
+                        cells_previous_iter = self.cells
+                        generalization_prev_iter = self._generalizations
+                        cells_by_id_prev = self._cells_by_id
+                        nodes = self._get_nodes_level(self._level)
+
+                        try:
+                            self._calculate_level_cells(self._level)
+                        except TypeError as e:
+                            print(e)
+                            self._level -= 1
+                            break
+
+                        self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+
+                        generalized = self._generalize(x_test, x_prepared_test, nodes)
+                        accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                        # if accuracy passed threshold roll back to previous iteration generalizations
+                        if accuracy < self.target_accuracy:
+                            self.cells = cells_previous_iter
+                            self._generalizations = generalization_prev_iter
+                            self._cells_by_id = cells_by_id_prev
+                            self._level -= 1
+                            break
+                        else:
+                            print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
+
+                # if accuracy below threshold, improve accuracy by removing features from generalization
+                elif accuracy < self.target_accuracy:
+                    print('Improving accuracy')
+                    while accuracy < self.target_accuracy:
+                        removed_feature = self._remove_feature_from_generalization(x_test, x_prepared_test,
+                                                                                nodes, y_test,
+                                                                                self._feature_data, accuracy,
+                                                                                self.generalize_using_transform)
+                        if removed_feature is None:
+                            break
+
+                        generalized = self._generalize(x_test, x_prepared_test, nodes)
+                        accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                        print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
+
+                # self._cells currently holds the chosen generalization based on target accuracy
+
+                # calculate iLoss
+                x_test_dataset = ArrayDataset(x_test, features_names=self._features)
+                self._ncp_scores.fit_score = self.calculate_ncp(x_test_dataset)
+                self._ncp_scores.generalizations_score = self.calculate_ncp(x_test_dataset)
+
+            #does the minimum number of generalizations needed to achieve k-anonymity
+            elif self.mode == K_ANONYMITY_MODE:
+                x = pd.DataFrame(dataset.get_samples(), columns=self._features)
+                if not self.features_to_minimize:
+                    self.features_to_minimize = self._features
+                self.features_to_minimize = [str(i) for i in self.features_to_minimize]
+                if not all(elem in self._features for elem in self.features_to_minimize):
+                    raise ValueError('features to minimize should be a subset of features names')
+                if self.feature_slices:
+                    temp_list = []
+                    for slice in self.feature_slices:
+                        new_slice = [str(i) for i in slice]
+                        if not all(elem in self._features for elem in new_slice):
+                            raise ValueError('features in slices should be a subset of features names')
+                        temp_list.append(new_slice)
+                    self.feature_slices = temp_list
+                x_qi = x.loc[:, self.features_to_minimize]
+
+                # divide dataset into train and test
+                used_data = x
+                if self.train_only_features_to_minimize:
+                    used_data = x_qi
+                if self.is_regression:
+                    x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(), test_size=0.4,
+                                                                        random_state=14)
+                else:
+                    try:
+                        x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(),
+                                                                            stratify=dataset.get_labels(), test_size=0.4,
+                                                                            random_state=18)
+                    except ValueError:
+                        print('Could not stratify split due to uncommon class value, doing unstratified split instead')
+                        x_train, x_test, y_train, y_test = train_test_split(x, dataset.get_labels(), test_size=0.4,
+                                                                            random_state=18)
+
+                x_train_qi = x_train.loc[:, self.features_to_minimize]
+                x_test_qi = x_test.loc[:, self.features_to_minimize]
+                used_x_train = x_train
+                used_x_test = x_test
+                if self.train_only_features_to_minimize:
+                    used_x_train = x_train_qi
+                    used_x_test = x_test_qi
+
+                # collect feature data (such as min, max)
+                self._feature_data = self._get_feature_data(x)
+
+                self.cells = []
+                self._categorical_values = {}
+
+                if self.is_regression:
+                    self._dt = DecisionTreeRegressor(random_state=10, min_samples_split=2, min_samples_leaf=1)
+                else:
+                    self._dt = DecisionTreeClassifier(random_state=0, min_samples_split=2,
+                                                    min_samples_leaf=1)
+
+                # prepare data for DT
+                self._encode_categorical_features(used_data, save_mapping=True)
+                x_prepared = self._encode_categorical_features(used_x_train)
+                self._dt.fit(x_prepared, y_train)
+                x_prepared_test = self._encode_categorical_features(used_x_test)
+
+                self._calculate_cells()
+                self._modify_cells()
+                # features that are not from QI should not be part of generalizations
+                for feature in self._features:
+                    if feature not in self.features_to_minimize:
+                        self._remove_feature_from_cells(self.cells, self._cells_by_id, feature)
+
+                nodes = self._get_nodes_level(0)
+                self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+
+                # self._cells currently holds the generalization created from the tree leaves
+                generalized = self._generalize(x_test, x_prepared_test, nodes)
+
+                # check accuracy
+                accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                print('Initial accuracy of model on generalized data, relative to original model predictions '
+                '(base generalization derived from tree, before improvements): %f' % accuracy)
+
+                # check the k anaonymity
+                k = minimiser_expansion.k_anonymity(generalized)
+                print('K anonymity is: %f' % k)
+                print('Target K anonymity is: %f' % self.target_k)
+
+                # if k anonymity below threshold, improve generalization
+                if not minimiser_expansion.has_k_anonymity(generalized, target_k=self.target_k):
+                    print('Improving generalizations')
+                    self._level = 0
+                    while k < self.target_k:
+                        self._level += 1
+                        nodes = self._get_nodes_level(self._level)
+
+                        try:
+                            self._calculate_level_cells(self._level)
+                        except TypeError as e:
+                            print(e)
+                            self._level -= 1
+                            break
+
+                        self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+
+                        generalized = self._generalize(x_test, x_prepared_test, nodes)
+                        k = minimiser_expansion.k_anonymity(generalized)
+
+                        # if accuracy passed threshold roll back to previous iteration generalizations
+                        if minimiser_expansion.has_k_anonymity(generalized, target_k=self.target_k):
+                            break
+                        else:
+                            print('Pruned tree to level: %d, new k anonymity: %f' % (self._level, k))
+
+                # if k anonymity above threshold, improve accuracy by removing features from generalization
+                elif k > self.target_k:
+                    print('Improving accuracy')
+                    while k > self.target_k:
+                        prev_self = self
+                        removed_feature = self._remove_feature_from_generalization(x_test, x_prepared_test,
+                                                                                nodes, y_test,
+                                                                                self._feature_data, accuracy,
+                                                                                self.generalize_using_transform)
+                        if removed_feature is None:
+                            break
+
+                        generalized = self._generalize(x_test, x_prepared_test, nodes)
+                        k = minimiser_expansion.k_anonymity(generalized)
+                        print('Removed feature: %s, new k anonymity:: %f' % (removed_feature, k))
+                    self = prev_self
+
+                # self._cells currently holds the chosen generalization based on target accuracy
+
+                # calculate iLoss
+                x_test_dataset = ArrayDataset(x_test, features_names=self._features)
+                self._ncp_scores.fit_score = self.calculate_ncp(x_test_dataset)
+                self._ncp_scores.generalizations_score = self.calculate_ncp(x_test_dataset)
+                
+                
         else:
             print('No fitting was performed as some information was missing')
             if not self.estimator:

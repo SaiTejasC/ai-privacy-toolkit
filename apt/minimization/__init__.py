@@ -14,3 +14,4 @@ It is also possible to export the generalizations as feature ranges.
 
 """
 from apt.minimization.minimizer import GeneralizeToRepresentative
+from .minimiser_expansion import *
